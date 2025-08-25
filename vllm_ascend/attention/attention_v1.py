@@ -29,8 +29,9 @@ from vllm.config import VllmConfig
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.utils import cdiv, direct_register_custom_op
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.attention.layer import (maybe_save_kv_layer_to_connector,
-                                  wait_for_kv_layer_from_connector)
+from vllm.distributed.kv_transfer import (get_kv_transfer_group,
+                                          has_kv_transfer_group,
+                                          is_v1_kv_transfer_group)
 
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.ops.attention import vanilla_chunked_prefill
@@ -545,3 +546,33 @@ direct_register_custom_op(
     fake_impl=unified_attention_with_output_fake,
     dispatch_key="PrivateUse1",
 )
+
+def maybe_save_kv_layer_to_connector(
+    layer_name: str,
+    kv_cache_layer: List[torch.Tensor],
+):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    assert isinstance(attn_metadata, AscendMetadata)
+    connector.save_kv_layer(layer_name, kv_cache_layer,
+                            torch.tensor(0)) # TODO fixme
+
+def wait_for_kv_layer_from_connector(layer_name: str):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+
+    connector = get_kv_transfer_group()
+
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    assert isinstance(attn_metadata, AscendMetadata)
+    connector.wait_for_layer_load(layer_name)
