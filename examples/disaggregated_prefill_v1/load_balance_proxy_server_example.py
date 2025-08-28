@@ -470,7 +470,7 @@ async def _handle_completions(api: str, request: Request):
             raise thread_exception
         response_json = thread_result
         with proxy_state.req_id_queue_lock:
-            del proxy_state.req_id_queue[request_id]
+            proxy_state.req_id_queue.pop(request_id, None)
 
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
         if not is_layerwise:
@@ -527,6 +527,10 @@ async def _handle_completions(api: str, request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
+    finally:
+        with proxy_state.req_id_queue_lock:
+            proxy_state.req_id_queue.pop(request_id, None)
+
 
 
 @app.post("/v1/completions")
