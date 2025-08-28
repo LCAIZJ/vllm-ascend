@@ -152,6 +152,7 @@ class ProxyState:
         heapq.heapify(self.prefiller_heap)
         heapq.heapify(self.decoder_heap)
         self.req_id_queue = {}
+        self.req_id_queue_lock = threading.Lock()
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -448,7 +449,8 @@ async def _handle_completions(api: str, request: Request):
         prefiller = proxy_state.prefillers[prefiller_idx]
         # Send request to prefiller
         result_queue = queue.Queue()
-        proxy_state.req_id_queue[request_id] = result_queue
+        with proxy_state.req_id_queue_lock:
+            proxy_state.req_id_queue[request_id] = result_queue
         thread = threading.Thread(
             target=run_in_thread,
             args=(
@@ -467,7 +469,8 @@ async def _handle_completions(api: str, request: Request):
         if thread_exception:
             raise thread_exception
         response_json = thread_result
-        del proxy_state.req_id_queue[request_id]
+        with proxy_state.req_id_queue_lock:
+            del proxy_state.req_id_queue[request_id]
 
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
         if not is_layerwise:
@@ -551,10 +554,10 @@ async def handle_prefill_info(request: Request):
         request_id = req_data.get('request_id', "")
         if not request_id:
             return
-
-        if request_id in proxy_state.req_id_queue:
-            result_queue = proxy_state.req_id_queue[request_id]
-            result_queue.put((True, req_data, None))
+        with proxy_state.req_id_queue_lock:
+            if request_id in proxy_state.req_id_queue:
+                result_queue = proxy_state.req_id_queue[request_id]
+                result_queue.put((True, req_data, None))
     except Exception as e:
         logger.error(
             f"Post metaserver failed with: {str(e)}"
