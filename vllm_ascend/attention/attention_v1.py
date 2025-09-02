@@ -547,32 +547,30 @@ direct_register_custom_op(
     dispatch_key="PrivateUse1",
 )
 
+def wait_for_kv_layer_from_connector(layer_name: str):
+    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
+        return
+    
+    connector = get_kv_transfer_group()
+    
+    forward_context: ForwardContext = get_forward_context()
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    connector.wait_for_layer_load(layer_name)
+
+
 def maybe_save_kv_layer_to_connector(
-    layer_name: str,
+    layer_name:str,
     kv_cache_layer: List[torch.Tensor],
 ):
     if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
         return
-
+    
     connector = get_kv_transfer_group()
-
+    
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     if attn_metadata is None:
         return
-    assert isinstance(attn_metadata, AscendMetadata)
-    connector.save_kv_layer(layer_name, kv_cache_layer,
-                            torch.tensor(0)) # TODO fixme
-
-def wait_for_kv_layer_from_connector(layer_name: str):
-    if not has_kv_transfer_group() or not is_v1_kv_transfer_group():
-        return
-
-    connector = get_kv_transfer_group()
-
-    forward_context: ForwardContext = get_forward_context()
-    attn_metadata = forward_context.attn_metadata
-    if attn_metadata is None:
-        return
-    assert isinstance(attn_metadata, AscendMetadata)
-    connector.wait_for_layer_load(layer_name)
+    connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
