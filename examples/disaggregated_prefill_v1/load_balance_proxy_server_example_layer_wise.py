@@ -87,11 +87,12 @@
 
 import argparse
 import asyncio
+import functools
 import heapq
 import os
 import sys
+import uuid
 import threading
-import queue
 from contextlib import asynccontextmanager
 from typing import List
 
@@ -139,7 +140,6 @@ class ProxyState:
         ]
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
-        self.req_id_counter = 0
         # Removed selection locks - no longer needed for synchronous methods
 
         # Initialize priority queues for efficient server selection
@@ -152,7 +152,6 @@ class ProxyState:
         heapq.heapify(self.prefiller_heap)
         heapq.heapify(self.decoder_heap)
         self.req_id_queue = {}
-        self.req_id_queue_lock = threading.Lock()
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -197,8 +196,7 @@ class ProxyState:
 
     async def next_req_id(self):
         async with self.req_id_lock:
-            self.req_id_counter += 1
-            return str(self.req_id_counter)
+            return str(uuid.uuid4())
 
     def select_prefiller(self, token_count):  # Changed to synchronous
         # No lock needed - entire function is atomic
@@ -317,6 +315,32 @@ async def lifespan(app: FastAPI):
         await d.client.aclose()
 
 
+async def listen_for_disconnect(request: Request) -> None:
+    """Return if a disconnect message is received"""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            break
+
+
+def with_cancellation(handler_func):
+    
+    @functools.wraps(handler_func)
+    async def wrapper(*args, **kwargs):
+        request = kwargs["request"]
+        handler_task = asyncio.create_task(handler_func(*args, **kwargs))
+        cancellation_task = asyncio.create_task(listen_for_disconnect(request))
+        done, pending = await asyncio.wait([handler_task, cancellation_task],
+                                           return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if handler_task in done:
+            return handler_task.result()
+        return None
+    
+    return wrapper
+        
+
 app = FastAPI(lifespan=lifespan)
 
 
@@ -338,6 +362,7 @@ async def send_request_to_service(client: httpx.AsyncClient,
         "remote_host": None,
         "remote_port": None,
         "aborted_request": list(aborted_requests),
+        "metaserver": f"http://{global_args.host}:{global_args.port}/v1/metaserver"
     }
     req_data["stream"] = False
     req_data["max_tokens"] = 1
@@ -420,19 +445,12 @@ async def stream_service_response_with_retry(client: httpx.AsyncClient,
                     raise e
 
 
-def run_in_thread(result_queue, *args, **kwargs):
-    try:
-        # 创建独立事件循环
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+def get_api_request_id(api, req_id):
+    if api == "/completions":
+        return "cmpl-" + req_id + "-0"
+    elif api == "/chat/completions":
+        return "chatcmpl-" + req_id
 
-        # 运行异步函数并获取结果
-        result = loop.run_until_complete(
-            send_request_to_service(*args, **kwargs)
-        )
-        result_queue.put((False, result.json(), None))  # 成功结果
-    except Exception as e:
-        result_queue.put((False, None, e))  # 异常处理
 
 async def _handle_completions(api: str, request: Request):
     try:
@@ -447,38 +465,36 @@ async def _handle_completions(api: str, request: Request):
         # Select prefiller
         prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
+        result_queue = asyncio.Queue()
+        request_id_api = get_api_request_id(api, request_id)
+        proxy_state.req_id_queue[request_id_api] = result_queue
         # Send request to prefiller
-        result_queue = queue.Queue()
-        with proxy_state.req_id_queue_lock:
-            proxy_state.req_id_queue[request_id] = result_queue
-        thread = threading.Thread(
-            target=run_in_thread,
-            args=(
-                result_queue,
-                prefiller.client,
-                prefiller_idx,
-                api,
-                req_data,
-                request_id,
-                global_args.max_retries,
-                global_args.retry_delay
-            )
-        )
-        thread.start()
-        is_layerwise, thread_result, thread_exception = result_queue.get(timeout=10)
-        if thread_exception:
-            raise thread_exception
-        response_json = thread_result
-        with proxy_state.req_id_queue_lock:
-            proxy_state.req_id_queue.pop(request_id, None)
-
+        response = await send_request_to_service(
+            prefiller.client,
+            prefiller_idx,
+            api,
+            req_data,
+            request_id,
+            max_retries=global_args.max_retries,
+            base_delay=global_args.retry_delay)
         proxy_state.release_prefiller(prefiller_idx, prefiller_score)
-        if not is_layerwise:
-            kv_transfer_params = response_json.get('kv_transfer_params', {})
-            if kv_transfer_params:
-                req_data["kv_transfer_params"] = kv_transfer_params
-        else:
-            req_data["kv_transfer_params"] = response_json
+        response_json = response.json()
+        # kv_transfer_params = response_json.get('kv_transfer_params', {})
+        # if kv_transfer_params:
+        #     req_data["kv_transfer_params"] = kv_transfer_params
+        
+        try:
+            is_layer_wise, response_json = await result_queue.get()
+            del proxy_state.req_id_queue[request_id_api]
+            if not is_layer_wise:
+                kv_transfer_params = response_json.get("kv_transfer_params", {})
+                if kv_transfer_params:
+                    req_data["kv_transfer_params"] = kv_transfer_params
+            else:
+                req_data["kv_transfer_params"] = response_json
+        except Exception as e:
+            logger.error(f"Error during get response from metaserver")
+            return
 
         # Select decoder
         decoder_score = proxy_state.calculate_decode_scores(request_length)
@@ -489,7 +505,6 @@ async def _handle_completions(api: str, request: Request):
         logger.debug("Using %s %s", prefiller.url, decoder.url)
         # Stream response from decoder
         released_kv = False
-
         async def generate_stream():
             nonlocal released_kv
             # Only one await per chunk, minimal logic in loop
@@ -527,18 +542,16 @@ async def _handle_completions(api: str, request: Request):
         print(e)
         print("".join(traceback.format_exception(*exc_info)))
         raise
-    finally:
-        with proxy_state.req_id_queue_lock:
-            proxy_state.req_id_queue.pop(request_id, None)
-
 
 
 @app.post("/v1/completions")
+@with_cancellation
 async def handle_completions(request: Request):
     return await _handle_completions("/completions", request)
 
 
 @app.post("/v1/chat/completions")
+@with_cancellation
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/chat/completions", request)
 
@@ -551,21 +564,23 @@ async def healthcheck():
         "decode_instances": len(proxy_state.decoders)
     }
 
+
 @app.post("/v1/metaserver")
-async def handle_prefill_info(request: Request):
+async def metaserver(request: Request):
     try:
         req_data = await request.json()
-        request_id = req_data.get('request_id', "")
+        request_id = req_data.get("request_id", "")
         if not request_id:
             return
-        with proxy_state.req_id_queue_lock:
-            if request_id in proxy_state.req_id_queue:
-                result_queue = proxy_state.req_id_queue[request_id]
-                result_queue.put((True, req_data, None))
+        if request_id in proxy_state.req_id_queue:
+            assert request_id in proxy_state.req_id_queue.keys()
+            result_queue = proxy_state.req_id_queue[request_id]
+            await result_queue.put((True, req_data))
     except Exception as e:
         logger.error(
             f"Post metaserver failed with: {str(e)}"
         )
+
 
 if __name__ == '__main__':
     global global_args
