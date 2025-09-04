@@ -296,7 +296,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         #    while True:
         #       recv_msg from decode and add to self.decode_request
         # 
-        # Listen for new requests for metadata.
+        # Prefiller listen for metadata from decoder.
         # NOTE(rob): we need each rank to have a unique port. This hack to keeps
         # us moving. We will switch when moving to etcd or where we have a
         # single ZMQ socket in the scheduler.
@@ -331,6 +331,10 @@ class KVCacheSendingLayerThread(threading.Thread):
                     logger.error("Failed to decode message: %s", e)
 
     def _post_transfer(self, request_id: str):
+        # layerwise step9
+        # Prefiiler send request id of request which has been finished transfered to decoder.
+        # Callback funciton
+        # This function will be called when task_tracker finds that all transfer tasks are complete.
         with self.lock:
             decoder_meta = self.ready_decode.pop(request_id)
         path = make_zmq_path("tcp", decoder_meta.host, decoder_meta.port)
@@ -344,7 +348,7 @@ class KVCacheSendingLayerThread(threading.Thread):
 
 
     def add_request(self, request_id: str, layer_name: str, local_block_ids: list[int], layer_index: int):
-        #TODO layerwise step 8
+        #TODO layerwise step8
         # if request_id in self.decode_request:
         #   self.send_layer_thread.send_queue.add(request)
         with self.lock:
@@ -369,7 +373,7 @@ class SendingLayerThread(threading.Thread):
     def run(self):
         """Run the thread to handle KV cache receiving for prefiller bye messages."""
         #TODO layerwise step8
-        # send kv cache for request in send_queue
+        # use thread to async send kv cache for request in send_queue
         # while True:
         #    get requeset form send_queue and send to decoder
         #    _handle_request(self, req_meta: dict[str, Any]):
@@ -379,7 +383,8 @@ class SendingLayerThread(threading.Thread):
 
     def _handle_request(self, request: tuple[DecodeMooncakeAgentMetadata, str, str, list[int], int]):
         #TODO layerwise step8
-        # send kv layer to remote
+        # Prefiller send kv layer to decoder and update task count.
+        # Task tracker records all finished layer transfer tasks of each request.
         req_meta, request_id, layer_name, local_block_ids, layer_index = request
 
         try:
@@ -397,7 +402,7 @@ class SendingLayerThread(threading.Thread):
 
     def _transfer_kv_cache(self, req_meta: DecodeMooncakeAgentMetadata, local_block_ids: list[int], layer_index: int):
         #TODO layerwise step8
-        # send kv layer to remote
+        # Prefiller caculate address and send kv layer to remote decoder.
         if len(local_block_ids) == 0:
             return
 
@@ -424,7 +429,7 @@ class SendingLayerThread(threading.Thread):
             for group_remote_block_id, group_local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
                 src = src_layer_base_addr + group_local_block_id[0] * block_len
                 dst = dst_layer_base_addr + group_remote_block_id[0] * block_len
-                length = len(local_block_ids) * block_len
+                length = len(group_local_block_id) * block_len
                 src_list.append(src)
                 dst_list.append(dst)
                 length_list.append(length)
@@ -432,7 +437,7 @@ class SendingLayerThread(threading.Thread):
 
         if ret < 0:
             logger.error("Mooncake transfer failed for request %s",
-                         req_meta["request_id"])
+                         req_meta.req_id)
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
 class KVCacheRecvingThread(threading.Thread):
@@ -710,11 +715,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
         #TODO layerwise step9
         # with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
         #    while True:
-        #       recv_msg from prefill request send finish=
-        # Listen for new requests for metadata.
-        # NOTE(rob): we need each rank to have a unique port. This hack to keeps
-        # us moving. We will switch when moving to etcd or where we have a
-        # single ZMQ socket in the scheduler.
+        #       recv_msg from prefill request send finish
+        # Decoder listen for finish request messages from prefiller.
         handshake_port = self.side_channel_port + self.tp_rank
         path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
         logger.info("Starting listening on path: %s", path)
@@ -1289,6 +1291,8 @@ class MooncakeConnectorWorker:
                     remote_handshake_port=remote_handshake_port,
                 )
         else:
+            # layerwise step4
+            # Prefiller send metadata to metaserver.
             if self.vllm_config.kv_transfer_config.is_kv_producer:
                 for req_id, meta in metadata.requests.items():
                     if self.tp_rank == 0:
@@ -1311,6 +1315,8 @@ class MooncakeConnectorWorker:
                             if future.exception():
                                 logger.error(f"Access metaserver fail: {future.exception()}")
                         future.add_done_callback(handle_exception)
+            # layerwise step7 
+            # Decoder send decode metadata to prefiller.
             else:
                 for req_id, meta in metadata.requests.items():
                     path = make_zmq_path("tcp", meta.remote_host, meta.remote_port + self.tp_rank)
@@ -1339,7 +1345,7 @@ class MooncakeConnectorWorker:
                       connector_metadata: MooncakeConnectorMetadata, **kwargs) -> None:
         """MooncakeConnector does not save explicitly."""
         #TODO layerwise step8
-        # ansyc send kv layer
+        # Prefiller ansyc send kv layer to decoder.
         # self.kv_send_layer_thread.add_request(  # type: ignore[union-attr]
         #         request_id=req_id,
         #         layer_name=layer_name,
